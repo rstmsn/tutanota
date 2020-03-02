@@ -390,7 +390,7 @@ function createElement ( doc, tag, props, children ) {
         for ( attr in props ) {
             value = props[ attr ];
             if ( value !== undefined ) {
-                el.setAttribute( attr, props[ attr ] );
+                el.setAttribute( attr, value );
             }
         }
     }
@@ -500,16 +500,14 @@ function fixContainer ( container, root ) {
         isBR = child.nodeName === 'BR';
         if ( !isBR && isInline( child ) ) {
             if ( !wrapper ) {
-                 wrapper = createElement( doc,
-                    config.blockTag, config.blockAttributes );
+                 wrapper = createElement( doc, 'div' );
             }
             wrapper.appendChild( child );
             i -= 1;
             l -= 1;
         } else if ( isBR || wrapper ) {
             if ( !wrapper ) {
-                wrapper = createElement( doc,
-                    config.blockTag, config.blockAttributes );
+                wrapper = createElement( doc, 'div' );
             }
             fixCursor( wrapper, root );
             if ( isBR ) {
@@ -921,6 +919,7 @@ var deleteContentsOfRange = function ( range, root ) {
 // Contents of range will be deleted.
 // After method, range will be around inserted content
 var insertTreeFragmentIntoRange = function ( range, frag, root ) {
+    var firstInFragIsInline = frag.firstChild && isInline( frag.firstChild );
     var node, block, blockContentsAfterSplit, stopPoint, container, offset;
     var replaceBlock, firstBlockInFrag, nodeAfterSplit, nodeBeforeSplit;
     var tempRange;
@@ -946,11 +945,17 @@ var insertTreeFragmentIntoRange = function ( range, frag, root ) {
 
     // Merge the contents of the first block in the frag with the focused block.
     // If there are contents in the block after the focus point, collect this
-    // up to insert in the last block later. If the block is empty, replace
-    // it instead of merging.
+    // up to insert in the last block later. This preserves the style that was
+    // present in this bit of the page.
+    //
+    // If the block being inserted into is empty though, replace it instead of
+    // merging if the fragment had block contents.
+    // e.g. <blockquote><p>Foo</p></blockquote>
+    // This seems a reasonable approximation of user intent.
+
     block = getStartBlockOfRange( range, root );
     firstBlockInFrag = getNextBlock( frag, frag );
-    replaceBlock = !!block && isEmptyBlock( block );
+    replaceBlock = !firstInFragIsInline && !!block && isEmptyBlock( block );
     if ( block && firstBlockInFrag && !replaceBlock &&
             // Don't merge table cells or PRE elements into block
             !getNearest( firstBlockInFrag, frag, 'PRE' ) &&
@@ -1426,161 +1431,186 @@ var afterDelete = function ( self, range ) {
     }
 };
 
-var keyHandlers = {
-    enter: function ( self, event, range ) {
-        var root = self._root;
-        var block, parent, node, offset, nodeAfterSplit;
+var handleEnter = function ( self, shiftKey, range ) {
+    var root = self._root;
+    var block, parent, node, offset, nodeAfterSplit;
 
-        // We handle this ourselves
-        event.preventDefault();
-
-        // Save undo checkpoint and add any links in the preceding section.
-        // Remove any zws so we don't think there's content in an empty
-        // block.
-        self._recordUndoState( range );
+    // Save undo checkpoint and add any links in the preceding section.
+    // Remove any zws so we don't think there's content in an empty
+    // block.
+    self._recordUndoState( range );
+    if ( self._config.addLinks ) {
         addLinks( range.startContainer, root, self );
-        self._removeZWS();
-        self._getRangeAndRemoveBookmark( range );
+    }
+    self._removeZWS();
+    self._getRangeAndRemoveBookmark( range );
 
-        // Selected text is overwritten, therefore delete the contents
-        // to collapse selection.
-        if ( !range.collapsed ) {
-            deleteContentsOfRange( range, root );
+    // Selected text is overwritten, therefore delete the contents
+    // to collapse selection.
+    if ( !range.collapsed ) {
+        deleteContentsOfRange( range, root );
+    }
+
+    block = getStartBlockOfRange( range, root );
+
+    // Inside a PRE, insert literal newline, unless on blank line.
+    if ( block && ( parent = getNearest( block, root, 'PRE' ) ) ) {
+        moveRangeBoundariesDownTree( range );
+        node = range.startContainer;
+        offset = range.startOffset;
+        if ( node.nodeType !== TEXT_NODE ) {
+            node = self._doc.createTextNode( '' );
+            parent.insertBefore( node, parent.firstChild );
         }
-
-        block = getStartBlockOfRange( range, root );
-
-        // Inside a PRE, insert literal newline, unless on blank line.
-        if ( block && ( parent = getNearest( block, root, 'PRE' ) ) ) {
-            moveRangeBoundariesDownTree( range );
-            node = range.startContainer;
-            offset = range.startOffset;
-            if ( node.nodeType !== TEXT_NODE ) {
-                node = self._doc.createTextNode( '' );
-                parent.insertBefore( node, parent.firstChild );
+        // If blank line: split and insert default block
+        if ( !shiftKey &&
+                ( node.data.charAt( offset - 1 ) === '\n' ||
+                    rangeDoesStartAtBlockBoundary( range, root ) ) &&
+                ( node.data.charAt( offset ) === '\n' ||
+                    rangeDoesEndAtBlockBoundary( range, root ) ) ) {
+            node.deleteData( offset && offset - 1, offset ? 2 : 1 );
+            nodeAfterSplit =
+                split( node, offset && offset - 1, root, root );
+            node = nodeAfterSplit.previousSibling;
+            if ( !node.textContent ) {
+                detach( node );
             }
-            // If blank line: split and insert default block
-            if ( !event.shiftKey &&
-                    ( node.data.charAt( offset - 1 ) === '\n' ||
-                        rangeDoesStartAtBlockBoundary( range, root ) ) &&
-                    ( node.data.charAt( offset ) === '\n' ||
-                        rangeDoesEndAtBlockBoundary( range, root ) ) ) {
-                node.deleteData( offset && offset - 1, offset ? 2 : 1 );
-                nodeAfterSplit =
-                    split( node, offset && offset - 1, root, root );
-                node = nodeAfterSplit.previousSibling;
-                if ( !node.textContent ) {
-                    detach( node );
-                }
-                node = self.createDefaultBlock();
-                nodeAfterSplit.parentNode.insertBefore( node, nodeAfterSplit );
-                if ( !nodeAfterSplit.textContent ) {
-                    detach( nodeAfterSplit );
-                }
-                range.setStart( node, 0 );
+            node = self.createDefaultBlock();
+            nodeAfterSplit.parentNode.insertBefore( node, nodeAfterSplit );
+            if ( !nodeAfterSplit.textContent ) {
+                detach( nodeAfterSplit );
+            }
+            range.setStart( node, 0 );
+        } else {
+            node.insertData( offset, '\n' );
+            fixCursor( parent, root );
+            // Firefox bug: if you set the selection in the text node after
+            // the new line, it draws the cursor before the line break still
+            // but if you set the selection to the equivalent position
+            // in the parent, it works.
+            if ( node.length === offset + 1 ) {
+                range.setStartAfter( node );
             } else {
-                node.insertData( offset, '\n' );
-                fixCursor( parent, root );
-                // Firefox bug: if you set the selection in the text node after
-                // the new line, it draws the cursor before the line break still
-                // but if you set the selection to the equivalent position
-                // in the parent, it works.
-                if ( node.length === offset + 1 ) {
-                    range.setStartAfter( node );
-                } else {
-                    range.setStart( node, offset + 1 );
-                }
-            }
-            range.collapse( true );
-            self.setSelection( range );
-            self._updatePath( range, true );
-            self._docWasChanged();
-            return;
-        }
-
-        // If this is a malformed bit of document or in a table;
-        // just play it safe and insert a <br>.
-        if ( !block || event.shiftKey || /^T[HD]$/.test( block.nodeName ) ) {
-            // If inside an <a>, move focus out
-            parent = getNearest( range.endContainer, root, 'A' );
-            if ( parent ) {
-                parent = parent.parentNode;
-                moveRangeBoundariesUpTree( range, parent, parent, root );
-                range.collapse( false );
-            }
-            insertNodeInRange( range, self.createElement( 'BR' ) );
-            range.collapse( false );
-            self.setSelection( range );
-            self._updatePath( range, true );
-            return;
-        }
-
-        // If in a list, we'll split the LI instead.
-        if ( parent = getNearest( block, root, 'LI' ) ) {
-            block = parent;
-        }
-
-        if ( isEmptyBlock( block ) ) {
-            // Break list
-            if ( getNearest( block, root, 'UL' ) ||
-                    getNearest( block, root, 'OL' ) ) {
-                return self.decreaseListLevel( range );
-            }
-            // Break blockquote
-            else if ( getNearest( block, root, 'BLOCKQUOTE' ) ) {
-                return self.modifyBlocks( removeBlockQuote, range );
+                range.setStart( node, offset + 1 );
             }
         }
-
-        // Otherwise, split at cursor point.
-        nodeAfterSplit = splitBlock( self, block,
-            range.startContainer, range.startOffset );
-
-        // Clean up any empty inlines if we hit enter at the beginning of the
-        // block
-        removeZWS( block );
-        removeEmptyInlines( block );
-        fixCursor( block, root );
-
-        // Focus cursor
-        // If there's a <b>/<i> etc. at the beginning of the split
-        // make sure we focus inside it.
-        while ( nodeAfterSplit.nodeType === ELEMENT_NODE ) {
-            var child = nodeAfterSplit.firstChild,
-                next;
-
-            // Don't continue links over a block break; unlikely to be the
-            // desired outcome.
-            if ( nodeAfterSplit.nodeName === 'A' &&
-                    ( !nodeAfterSplit.textContent ||
-                        nodeAfterSplit.textContent === ZWS ) ) {
-                child = self._doc.createTextNode( '' );
-                replaceWith( nodeAfterSplit, child );
-                nodeAfterSplit = child;
-                break;
-            }
-
-            while ( child && child.nodeType === TEXT_NODE && !child.data ) {
-                next = child.nextSibling;
-                if ( !next || next.nodeName === 'BR' ) {
-                    break;
-                }
-                detach( child );
-                child = next;
-            }
-
-            // 'BR's essentially don't count; they're a browser hack.
-            // If you try to select the contents of a 'BR', FF will not let
-            // you type anything!
-            if ( !child || child.nodeName === 'BR' ||
-                    ( child.nodeType === TEXT_NODE && !isPresto ) ) {
-                break;
-            }
-            nodeAfterSplit = child;
-        }
-        range = self.createRange( nodeAfterSplit, 0 );
+        range.collapse( true );
         self.setSelection( range );
         self._updatePath( range, true );
+        self._docWasChanged();
+        return;
+    }
+
+    // If this is a malformed bit of document or in a table;
+    // just play it safe and insert a <br>.
+    if ( !block || shiftKey || /^T[HD]$/.test( block.nodeName ) ) {
+        // If inside an <a>, move focus out
+        parent = getNearest( range.endContainer, root, 'A' );
+        if ( parent ) {
+            parent = parent.parentNode;
+            moveRangeBoundariesUpTree( range, parent, parent, root );
+            range.collapse( false );
+        }
+        insertNodeInRange( range, self.createElement( 'BR' ) );
+        range.collapse( false );
+        self.setSelection( range );
+        self._updatePath( range, true );
+        return;
+    }
+
+    // If in a list, we'll split the LI instead.
+    if ( parent = getNearest( block, root, 'LI' ) ) {
+        block = parent;
+    }
+
+    if ( isEmptyBlock( block ) ) {
+        // Break list
+        if ( getNearest( block, root, 'UL' ) ||
+                getNearest( block, root, 'OL' ) ) {
+            return self.decreaseListLevel( range );
+        }
+        // Break blockquote
+        else if ( getNearest( block, root, 'BLOCKQUOTE' ) ) {
+            return self.modifyBlocks( removeBlockQuote, range );
+        }
+    }
+
+    // Otherwise, split at cursor point.
+    nodeAfterSplit = splitBlock( self, block,
+        range.startContainer, range.startOffset );
+
+    // Clean up any empty inlines if we hit enter at the beginning of the
+    // block
+    removeZWS( block );
+    removeEmptyInlines( block );
+    fixCursor( block, root );
+
+    // Focus cursor
+    // If there's a <b>/<i> etc. at the beginning of the split
+    // make sure we focus inside it.
+    while ( nodeAfterSplit.nodeType === ELEMENT_NODE ) {
+        var child = nodeAfterSplit.firstChild,
+            next;
+
+        // Don't continue links over a block break; unlikely to be the
+        // desired outcome.
+        if ( nodeAfterSplit.nodeName === 'A' &&
+                ( !nodeAfterSplit.textContent ||
+                    nodeAfterSplit.textContent === ZWS ) ) {
+            child = self._doc.createTextNode( '' );
+            replaceWith( nodeAfterSplit, child );
+            nodeAfterSplit = child;
+            break;
+        }
+
+        while ( child && child.nodeType === TEXT_NODE && !child.data ) {
+            next = child.nextSibling;
+            if ( !next || next.nodeName === 'BR' ) {
+                break;
+            }
+            detach( child );
+            child = next;
+        }
+
+        // 'BR's essentially don't count; they're a browser hack.
+        // If you try to select the contents of a 'BR', FF will not let
+        // you type anything!
+        if ( !child || child.nodeName === 'BR' ||
+                ( child.nodeType === TEXT_NODE && !isPresto ) ) {
+            break;
+        }
+        nodeAfterSplit = child;
+    }
+    range = self.createRange( nodeAfterSplit, 0 );
+    self.setSelection( range );
+    self._updatePath( range, true );
+};
+
+var keyHandlers = {
+    // This song and dance is to force iOS to do enable the shift key
+    // automatically on enter. When you do the DOM split manipulation yourself,
+    // WebKit doesn't reset the IME state and so presents auto-complete options
+    // as though you were continuing to type on the previous line, and doesn't
+    // auto-enable the shift key. The old trick of blurring and focussing
+    // again no longer works in iOS 13, and I tried various execCommand options
+    // but they didn't seem to do anything. The only solution I've found is to
+    // let iOS handle the enter key, then after it's done that reset the HTML
+    // to what it was before and handle it properly in Squire; the IME state of
+    // course doesn't reset so you end up in the correct state!
+    enter: isIOS ? function ( self, event, range ) {
+        self._saveRangeToBookmark( range );
+        var html = self._getHTML();
+        var restoreAndDoEnter = function () {
+            self.removeEventListener( 'keyup', restoreAndDoEnter );
+            self._setHTML( html );
+            range = self._getRangeAndRemoveBookmark();
+            // Ignore the shift key on iOS, as this is for auto-capitalisation.
+            handleEnter( self, false, range );
+        };
+        self.addEventListener( 'keyup', restoreAndDoEnter );
+    } : function ( self, event, range ) {
+        event.preventDefault();
+        handleEnter( self, event.shiftKey, range );
     },
 
     'shift-enter': function ( self, event, range ) {
@@ -1762,7 +1792,9 @@ var keyHandlers = {
         var node, parent;
         var root = self._root;
         self._recordUndoState( range );
-        addLinks( range.startContainer, root, self );
+        if ( self._config.addLinks ) {
+            addLinks( range.startContainer, root, self );
+        }
         self._getRangeAndRemoveBookmark( range );
 
         // If the cursor is at the end of a link (<a>foo|</a>) then move it
@@ -1855,24 +1887,6 @@ var fontSizes = {
 };
 
 var styleToSemantic = {
-    backgroundColor: {
-        regexp: notWS,
-        replace: function ( doc, classNames, colour ) {
-            return createElement( doc, 'SPAN', {
-                'class': classNames.highlight,
-                style: 'background-color:' + colour
-            });
-        }
-    },
-    color: {
-        regexp: notWS,
-        replace: function ( doc, classNames, colour ) {
-            return createElement( doc, 'SPAN', {
-                'class': classNames.colour,
-                style: 'color:' + colour
-            });
-        }
-    },
     fontWeight: {
         regexp: /^bold|^700/i,
         replace: function ( doc ) {
@@ -1914,6 +1928,12 @@ var styleToSemantic = {
 var replaceWithTag = function ( tag ) {
     return function ( node, parent ) {
         var el = createElement( node.ownerDocument, tag );
+        var attributes = node.attributes;
+        var i, l, attribute;
+        for ( i = 0, l = attributes.length; i < l; i += 1 ) {
+            attribute = attributes[i];
+            el.setAttribute( attribute.name, attribute.value );
+        }
         parent.replaceChild( el, node );
         el.appendChild( empty( node ) );
         return el;
@@ -1930,6 +1950,10 @@ var replaceStyles = function ( node, parent, config ) {
         css = style[ attr ];
         if ( css && converter.regexp.test( css ) ) {
             el = converter.replace( doc, config.classNames, css );
+            if ( el.nodeName === node.nodeName &&
+                    el.className === node.className ) {
+                continue;
+            }
             if ( !newTreeTop ) {
                 newTreeTop = el;
             }
@@ -1943,18 +1967,13 @@ var replaceStyles = function ( node, parent, config ) {
 
     if ( newTreeTop ) {
         newTreeBottom.appendChild( empty( node ) );
-        if ( node.nodeName === 'SPAN' ) {
-            parent.replaceChild( newTreeTop, node );
-        } else {
-            node.appendChild( newTreeTop );
-        }
+        node.appendChild( newTreeTop );
     }
 
     return newTreeBottom || node;
 };
 
 var stylesRewriters = {
-    P: replaceStyles,
     SPAN: replaceStyles,
     STRONG: replaceWithTag( 'B' ),
     EM: replaceWithTag( 'I' ),
@@ -2254,9 +2273,7 @@ var onCut = function ( event ) {
     this.saveUndoState( range );
 
     // Edge only seems to support setting plain text as of 2016-03-11.
-    // Mobile Safari flat out doesn't work:
-    // https://bugs.webkit.org/show_bug.cgi?id=143776
-    if ( !isEdge && !isIOS && clipboardData ) {
+    if ( !isEdge && clipboardData ) {
         // Clipboard content should include all parents within block, or all
         // parents up to root if selection across blocks
         startBlock = getStartBlockOfRange( range, root );
@@ -2301,9 +2318,7 @@ var onCopy = function ( event ) {
     var startBlock, endBlock, copyRoot, contents, parent, newContents, node;
 
     // Edge only seems to support setting plain text as of 2016-03-11.
-    // Mobile Safari flat out doesn't work:
-    // https://bugs.webkit.org/show_bug.cgi?id=143776
-    if ( !isEdge && !isIOS && clipboardData ) {
+    if ( !isEdge && clipboardData ) {
         // Clipboard content should include all parents within block, or all
         // parents up to root if selection across blocks
         startBlock = getStartBlockOfRange( range, root );
@@ -2346,52 +2361,46 @@ var onPaste = function ( event ) {
     var items = clipboardData && clipboardData.items;
     var choosePlain = this.isShiftDown;
     var fireDrop = false;
+    var hasRTF = false;
     var hasImage = false;
     var plainItem = null;
+    var htmlItem = null;
     var self = this;
     var l, item, type, types, data;
 
     // Current HTML5 Clipboard interface
     // ---------------------------------
     // https://html.spec.whatwg.org/multipage/interaction.html
-
-    // Edge only provides access to plain text as of 2016-03-11 and gives no
-    // indication there should be an HTML part. However, it does support access
-    // to image data, so check if this is present and use if so.
-    if ( isEdge && items ) {
-        l = items.length;
-        while ( l-- ) {
-            if ( !choosePlain && /^image\/.*/.test( items[l].type ) ) {
-                hasImage = true;
-            }
-        }
-        if ( !hasImage ) {
-            items = null;
-        }
-    }
     if ( items ) {
-        event.preventDefault();
         l = items.length;
         while ( l-- ) {
             item = items[l];
             type = item.type;
-            if ( !choosePlain && type === 'text/html' ) {
-                /*jshint loopfunc: true */
-                item.getAsString( function ( html ) {
-                    self.insertHTML( html, true );
-                });
-                /*jshint loopfunc: false */
-                return;
-            }
-            if ( type === 'text/plain' ) {
+            if ( type === 'text/html' ) {
+                htmlItem = item;
+            // iOS copy URL gives you type text/uri-list which is just a list
+            // of 1 or more URLs separated by new lines. Can just treat as
+            // plain text.
+            } else if ( type === 'text/plain' || type === 'text/uri-list' ) {
                 plainItem = item;
-            }
-            if ( !choosePlain && /^image\/.*/.test( type ) ) {
+            } else if ( type === 'text/rtf' ) {
+                hasRTF = true;
+            } else if ( /^image\/.*/.test( type ) ) {
                 hasImage = true;
             }
         }
-        // Treat image paste as a drop of an image file.
-        if ( hasImage ) {
+
+        // Treat image paste as a drop of an image file. When you copy
+        // an image in Chrome/Firefox (at least), it copies the image data
+        // but also an HTML version (referencing the original URL of the image)
+        // and a plain text version.
+        //
+        // However, when you copy in Excel, you get html, rtf, text, image;
+        // in this instance you want the html version! So let's try using
+        // the presence of text/rtf as an indicator to choose the html version
+        // over the image.
+        if ( hasImage && !( hasRTF && htmlItem ) ) {
+            event.preventDefault();
             this.fireEvent( 'dragover', {
                 dataTransfer: clipboardData,
                 /*jshint loopfunc: true */
@@ -2405,12 +2414,26 @@ var onPaste = function ( event ) {
                     dataTransfer: clipboardData
                 });
             }
-        } else if ( plainItem ) {
-            plainItem.getAsString( function ( text ) {
-                self.insertPlainText( text, true );
-            });
+            return;
         }
-        return;
+
+        // Edge only provides access to plain text as of 2016-03-11 and gives no
+        // indication there should be an HTML part. However, it does support
+        // access to image data, so we check for that first. Otherwise though,
+        // fall through to fallback clipboard handling methods
+        if ( !isEdge ) {
+            event.preventDefault();
+            if ( htmlItem && ( !choosePlain || !plainItem ) ) {
+                htmlItem.getAsString( function ( html ) {
+                    self.insertHTML( html, true );
+                });
+            } else if ( plainItem ) {
+                plainItem.getAsString( function ( text ) {
+                    self.insertPlainText( text, true );
+                });
+            }
+            return;
+        }
     }
 
     // Old interface
@@ -2723,7 +2746,8 @@ proto.setConfig = function ( config ) {
         sanitizeToDOMFragment:
             typeof DOMPurify !== 'undefined' && DOMPurify.isSupported ?
             sanitizeToDOMFragment : null,
-        willCutCopy: null
+        willCutCopy: null,
+        addLinks: true
     }, config, true );
 
     // Users may specify block tag in lower case
@@ -3183,7 +3207,7 @@ proto._updatePathOnEvent = function ( event ) {
 // --- Focus ---
 
 proto.focus = function () {
-    this._root.focus();
+    this._root.focus({ preventScroll: true });
 
     if ( isIE ) {
         this.fireEvent( 'focus' );
@@ -4086,6 +4110,7 @@ proto.decreaseListLevel = function ( range ) {
     var list = listSelection[0];
     var startLi = listSelection[1];
     var endLi = listSelection[2];
+    var newParent, next, insertBefore, makeNotList;
     if ( !startLi ) {
         startLi = list.firstChild;
     }
@@ -4096,34 +4121,35 @@ proto.decreaseListLevel = function ( range ) {
     // Save undo checkpoint and bookmark selection
     this._recordUndoState( range, this._isInUndoState );
 
-    // Find the new parent list node
-    var newParent = list.parentNode;
-    var next;
+    if ( startLi ) {
+        // Find the new parent list node
+        newParent = list.parentNode;
 
-    // Split list if necesary
-    var insertBefore = !endLi.nextSibling ?
-        list.nextSibling :
-        split( list, endLi.nextSibling, newParent, root );
+        // Split list if necesary
+        insertBefore = !endLi.nextSibling ?
+            list.nextSibling :
+            split( list, endLi.nextSibling, newParent, root );
 
-    if ( newParent !== root && newParent.nodeName === 'LI' ) {
-        newParent = newParent.parentNode;
-        while ( insertBefore ) {
-            next = insertBefore.nextSibling;
-            endLi.appendChild( insertBefore );
-            insertBefore = next;
+        if ( newParent !== root && newParent.nodeName === 'LI' ) {
+            newParent = newParent.parentNode;
+            while ( insertBefore ) {
+                next = insertBefore.nextSibling;
+                endLi.appendChild( insertBefore );
+                insertBefore = next;
+            }
+            insertBefore = list.parentNode.nextSibling;
         }
-        insertBefore = list.parentNode.nextSibling;
+
+        makeNotList = !/^[OU]L$/.test( newParent.nodeName );
+        do {
+            next = startLi === endLi ? null : startLi.nextSibling;
+            list.removeChild( startLi );
+            if ( makeNotList && startLi.nodeName === 'LI' ) {
+                startLi = this.createDefaultBlock([ empty( startLi ) ]);
+            }
+            newParent.insertBefore( startLi, insertBefore );
+        } while (( startLi = next ));
     }
-
-    var makeNotList = !/^[OU]L$/.test( newParent.nodeName );
-    do {
-        next = startLi === endLi ? null : startLi.nextSibling;
-        list.removeChild( startLi );
-        if ( makeNotList && startLi.nodeName === 'LI' ) {
-            startLi = this.createDefaultBlock([ empty( startLi ) ]);
-        }
-        newParent.insertBefore( startLi, insertBefore );
-    } while ( ( startLi = next ) );
 
     if ( !list.firstChild ) {
         detach( list );
@@ -4322,7 +4348,57 @@ proto.insertImage = function ( src, attributes ) {
     return img;
 };
 
-proto.linkRegExp = /\b((?:(?:ht|f)tps?:\/\/|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,}\/)(?:[^\s()<>]+|\([^\s()<>]+\))+(?:\((?:[^\s()<>]+|(?:\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:'".,<>?«»“”‘’]))|([\w\-.%+]+@(?:[\w\-]+\.)+[A-Z]{2,}\b)(?:\?[^&?\s]+=[^&?\s]+(?:&[^&?\s]+=[^&?\s]+)*)?/i;
+/*
+const linkRegExp = new RegExp(
+// Only look on boundaries
+'\\b(?:' +
+// Capture group 1: URLs
+'(' +
+    // Add links to URLS
+    // Starts with:
+    '(?:' +
+        // http(s):// or ftp://
+        '(?:ht|f)tps?:\\/\\/' +
+        // or
+        '|' +
+        // www.
+        'www\\d{0,3}[.]' +
+        // or
+        '|' +
+        // foo90.com/
+        '[a-z0-9][a-z0-9.\\-]*[.][a-z]{2,}\\/' +
+    ')' +
+    // Then we get one or more:
+    '(?:' +
+        // Run of non-spaces, non ()<>
+        '[^\\s()<>]+' +
+        // or
+        '|' +
+        // balanced parentheses (one level deep only)
+        '\\([^\\s()<>]+\\)' +
+    ')+' +
+    // And we finish with
+    '(?:' +
+        // Not a space or punctuation character
+        '[^\\s?&`!()\\[\\]{};:\'".,<>«»“”‘’]' +
+        // or
+        '|' +
+        // Balanced parentheses.
+        '\\([^\\s()<>]+\\)' +
+    ')' +
+// Capture group 2: Emails
+')|(' +
+    // Add links to emails
+    '[\\w\\-.%+]+@(?:[\\w\\-]+\\.)+[a-z]{2,}\\b' +
+    // Allow query parameters in the mailto: style
+    '(?:' +
+        '[?][^&?\\s]+=[^\\s?&`!()\\[\\]{};:\'".,<>«»“”‘’]+' +
+        '(?:&[^&?\\s]+=[^\\s?&`!()\\[\\]{};:\'".,<>«»“”‘’]+)*' +
+    ')?' +
+'))', 'i' );
+*/
+
+proto.linkRegExp = /\b(?:((?:(?:ht|f)tps?:\/\/|www\d{0,3}[.]|[a-z0-9][a-z0-9.\-]*[.][a-z]{2,}\/)(?:[^\s()<>]+|\([^\s()<>]+\))+(?:[^\s?&`!()\[\]{};:'".,<>«»“”‘’]|\([^\s()<>]+\)))|([\w\-.%+]+@(?:[\w\-]+\.)+[a-z]{2,}\b(?:[?][^&?\s]+=[^\s?&`!()\[\]{};:'".,<>«»“”‘’]+(?:&[^&?\s]+=[^\s?&`!()\[\]{};:'".,<>«»“”‘’]+)*)?))/i;
 
 var addLinks = function ( frag, root, self ) {
     var doc = frag.ownerDocument;
@@ -4448,11 +4524,11 @@ proto.insertHTML = function ( html, isPaste ) {
     return this;
 };
 
-var escapeHTMLFragement = function ( text ) {
+var escapeHTML = function ( text ) {
     return text.split( '&' ).join( '&amp;' )
-               .split( '<' ).join( '&lt;'  )
-               .split( '>' ).join( '&gt;'  )
-               .split( '"' ).join( '&quot;'  );
+               .split( '<' ).join( '&lt;' )
+               .split( '>' ).join( '&gt;' )
+               .split( '"' ).join( '&quot;' );
 };
 
 proto.insertPlainText = function ( plainText, isPaste ) {
@@ -4498,14 +4574,16 @@ proto.insertPlainText = function ( plainText, isPaste ) {
 
     for ( attr in attributes ) {
         openBlock += ' ' + attr + '="' +
-            escapeHTMLFragement( attributes[ attr ] ) +
+            escapeHTML( attributes[ attr ] ) +
         '"';
     }
     openBlock += '>';
 
-    for ( i = 0, l = lines.length; i < l; i += 1 ) {
+    // We don't wrap the first line in the block, so if it gets inserted into
+    // a blank line it keeps that line's formatting.
+    for ( i = 1, l = lines.length; i < l; i += 1 ) {
         line = lines[i];
-        line = escapeHTMLFragement( line ).replace( / (?= )/g, '&nbsp;' );
+        line = escapeHTML( line ).replace( / (?= )/g, '&nbsp;' );
         // Wrap each line in <div></div>
         lines[i] = openBlock + ( line || '<BR>' ) + closeBlock;
     }
